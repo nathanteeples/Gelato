@@ -38,12 +38,29 @@
             <h3 class="sectionTitle">General Settings</h3>
 
             <div class="inputContainer">
-              <label class="inputLabel inputLabelUnfocused" for="txtUrl">AIOStreams URL (manifest or base):</label>
+              <label class="inputLabel inputLabelUnfocused" for="txtUrl">Primary Stremio addon URL (manifest or base):</label>
               <input is="emby-input" type="text" id="txtUrl" required="required" class="emby-input" />
-              <div class="fieldDescription">Paste the manifest URL or base endpoint. <code>GetBaseUrl()</code> will
-                strip <code>/manifest.json</code> automatically.</div>
+              <div class="fieldDescription">Paste a configured Stremio addon manifest URL or base endpoint.</div>
             </div>
 
+            <div class="inputContainer">
+              <label class="inputLabel" for="txtMetadataUrl">AIOMetadata endpoint:</label>
+              <input is="emby-input" type="text" id="txtMetadataUrl" class="emby-input" />
+              <div class="fieldDescription">Configured manifest or base URL. Metadata and search go directly here. Leave blank to use your addons.</div>
+            </div>
+            <div class="inputContainer">
+              <label class="inputLabel" for="txtAddonUrls">Additional Stremio addons (one URL per line):</label>
+              <textarea id="txtAddonUrls" class="emby-input" rows="4"></textarea>
+            </div>
+            <div class="inputContainer">
+              <label class="inputLabel" for="txtCatalogRefresh">Catalogue and manifest refresh interval (seconds):</label>
+              <input is="emby-input" type="number" min="30" max="86400" id="txtCatalogRefresh" class="emby-input" />
+            </div>
+            <div class="inputContainer"><label class="inputLabel" for="txtRequestTimeout">Addon request timeout (seconds):</label><input is="emby-input" type="number" min="2" max="120" id="txtRequestTimeout" class="emby-input" /></div>
+            <div class="checkboxContainer checkboxContainer-withDescription">
+              <label><input is="emby-checkbox" type="checkbox" id="chkHomeRows" /><span>Enable catalogue preview API and Web home rows</span></label>
+              <div class="fieldDescription">Web rows require frontend customization. Native clients can browse imported collections; home-row placement requires support in each client.</div>
+            </div>
             <div class="inputContainer">
               <label class="inputLabel inputLabelUnfocused" for="txtMoviePath">Movies path:</label>
               <input is="emby-input" type="text" id="txtMoviePath" class="emby-input" />
@@ -206,11 +223,13 @@
             <div id="userOverrideContainer"
               style="display:none; margin-top:1em; padding: 1em; background: rgba(0,0,0,0.1); border-radius: 4px;">
               <div class="inputContainer">
-                <label class="inputLabel" for="txtUserUrl">AIOStreams URL:</label>
+                <label class="inputLabel" for="txtUserUrl">Stremio addon URL:</label>
                 <input is="emby-input" type="text" id="txtUserUrl" class="emby-input" />
               </div>
 
-              <div class="inputContainer">
+              <div class="inputContainer"><label class="inputLabel" for="txtUserMetadataUrl">User AIOMetadata endpoint (blank inherits global):</label><input is="emby-input" id="txtUserMetadataUrl" class="emby-input" /></div>
+            <div class="inputContainer"><label class="inputLabel" for="txtUserAddonUrls">User additional addon URLs (one per line):</label><textarea id="txtUserAddonUrls" class="emby-input" rows="3"></textarea></div>
+            <div class="inputContainer">
                 <label class="inputLabel" for="txtUserMoviePath">Movie path:</label>
                 <input is="emby-input" type="text" id="txtUserMoviePath" class="emby-input" />
               </div>
@@ -325,6 +344,8 @@
             if (uc.UserId && guidRegex.test(uc.UserId)) {
               obj[uc.UserId] = {
                 Url: uc.Url,
+                MetadataUrl: uc.MetadataUrl || "",
+                AddonUrls: uc.AddonUrls || [],
                 MoviePath: uc.MoviePath,
                 SeriesPath: uc.SeriesPath,
                 DisableSearch: uc.DisableSearch,
@@ -347,10 +368,12 @@
             // Merge server catalogs with saved user preferences
             allCatalogs = (response || []).map(serverCat => {
               // Find matching saved catalog
-              const savedCat = savedCatalogs.find(s => s.Id === serverCat.Id && s.Type === serverCat.Type);
+              const savedCat = serverCat; // Server merges preferences by source, type and id.
               
               return {
                 Id: serverCat.Id || '',
+                Source: serverCat.Source || '',
+                ShowOnHome: savedCat ? savedCat.ShowOnHome !== false : true,
                 Type: serverCat.Type || '',
                 Name: serverCat.Name || '',
                 // Use saved user preference if available, otherwise use server default
@@ -402,7 +425,7 @@
                 <th style="padding: 10px;">Enabled</th>
                 <th style="padding: 10px;">Collection</th>
                 <th style="padding: 10px;">Max items</th>
-                <th style="padding: 10px;">Actions</th>
+                <th style="padding: 10px;">Home row</th><th style="padding: 10px;">Actions</th>
             `;
           table.appendChild(header);
 
@@ -430,6 +453,7 @@
             enabledCheck.checked = cat.Enabled;
             enabledCheck.is = 'emby-checkbox';
             enabledCheck.dataset.catalogId = cat.Id;
+            enabledCheck.dataset.source = cat.Source;
             enabledCheck.dataset.catalogType = cat.Type;
             enabledCheck.dataset.field = 'Enabled';
             enabledCell.appendChild(enabledCheck);
@@ -455,7 +479,8 @@
             maxCell.style.padding = '10px';
             const maxInput = document.createElement('input');
             maxInput.type = 'number';
-            maxInput.value = cat.MaxItems > 0 ? cat.MaxItems : 100;
+            maxInput.value = cat.MaxItems > 0 ? cat.MaxItems : 0;
+            maxInput.min = '0'; maxInput.title = '0 uses global catalogue limit';
             maxInput.disabled = !cat.Enabled;
             maxInput.style.width = '70px';
             maxInput.style.opacity = cat.Enabled ? '1' : '0.45';
@@ -468,6 +493,12 @@
 
             maxCell.appendChild(maxInput);
             row.appendChild(maxCell);
+
+            const homeCell = document.createElement('td');
+            const homeCheck = document.createElement('input');
+            homeCheck.type = 'checkbox'; homeCheck.checked = cat.ShowOnHome !== false;
+            homeCheck.dataset.field = 'ShowOnHome';
+            homeCell.appendChild(homeCheck); row.appendChild(homeCell);
 
             // Actions
             const actionCell = document.createElement('td');
@@ -534,10 +565,11 @@
 
             const catId = enabledCheck.dataset.catalogId;
             const catType = enabledCheck.dataset.catalogType;
-            const cat = allCatalogs.find(c => c.Id === catId && c.Type === catType);
+            const cat = allCatalogs.find(c => c.Id === catId && c.Type === catType && c.Source === enabledCheck.dataset.source);
             if (!cat) return;
 
             cat.Enabled = enabledCheck.checked;
+            cat.ShowOnHome = row.querySelector('[data-field="ShowOnHome"]').checked;
             cat.CreateCollection = collCheck.checked;
             cat.MaxItems = parseInt(maxInput.value) || 0;
           });
@@ -548,7 +580,7 @@
           Dashboard.showLoadingMsg();
           try {
             // FIXED: Use string concatenation
-            const url = window.ApiClient.getUrl('gelato/catalogs/' + encodeURIComponent(cat.Id) + '/' + encodeURIComponent(cat.Type) + '/import');
+            const url = window.ApiClient.getUrl('gelato/catalogs/' + encodeURIComponent(cat.Id) + '/' + encodeURIComponent(cat.Type) + '/import', { source: cat.Source });
             await window.ApiClient.ajax({ type: "POST", url: url });
             Dashboard.alert("Import started.");
           } catch (e) {
@@ -582,6 +614,11 @@
             currentConfig = cfg;
             // Populate fields
             if (txtUrl) txtUrl.value = cfg.Url || "";
+            page.querySelector('#txtMetadataUrl').value = cfg.MetadataUrl || '';
+            page.querySelector('#txtAddonUrls').value = (cfg.AddonUrls || []).join('\n');
+            page.querySelector('#txtCatalogRefresh').value = cfg.CatalogRefreshSeconds || 300;
+            page.querySelector('#txtRequestTimeout').value = cfg.RequestTimeoutSeconds || 10;
+            page.querySelector('#chkHomeRows').checked = cfg.EnableHomeRows || false;
             if (txtMoviePath) txtMoviePath.value = cfg.MoviePath || "";
             if (txtSeriesPath) txtSeriesPath.value = cfg.SeriesPath || "";
             if (txtStreamTTL) txtStreamTTL.value = cfg.StreamTTL || 3600;
@@ -612,6 +649,12 @@
           try {
             const cfg = await window.ApiClient.getPluginConfiguration(pluginId);
             cfg.Url = txtUrl.value.trim();
+            cfg.MetadataUrl = page.querySelector('#txtMetadataUrl').value.trim();
+            cfg.AddonUrls = page.querySelector('#txtAddonUrls').value.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+            cfg.CatalogRefreshSeconds = Math.max(30, Math.min(86400, Number(page.querySelector('#txtCatalogRefresh').value) || 300));
+            cfg.ManifestRefreshSeconds = cfg.CatalogRefreshSeconds;
+            cfg.RequestTimeoutSeconds = Math.max(2, Math.min(120, Number(page.querySelector('#txtRequestTimeout').value) || 10));
+            cfg.EnableHomeRows = page.querySelector('#chkHomeRows').checked;
             cfg.MoviePath = txtMoviePath.value.trim();
             cfg.SeriesPath = txtSeriesPath.value.trim();
 
@@ -633,7 +676,7 @@
             // Only collect catalog states if catalogs have been loaded (i.e., if we're on catalogs tab or it was loaded)
             if (allCatalogs.length > 0) {
               collectCatalogStatesFromDOM();
-              cfg.Catalogs = allCatalogs;
+              cfg.Catalogs = (cfg.Catalogs || []).filter(old => !allCatalogs.some(c => c.Source === old.Source && c.Id === old.Id && c.Type === old.Type)).concat(allCatalogs);
             } else {
               // If catalogs haven't been loaded, keep the existing catalog configuration
               // This prevents overwriting catalog settings when saving from other tabs
@@ -646,6 +689,8 @@
             cfg.UserConfigs = Object.entries(userConfigsObj).map(([userId, override]) => ({
               UserId: userId,
               Url: override.Url,
+              MetadataUrl: override.MetadataUrl || "",
+              AddonUrls: override.AddonUrls || [],
               MoviePath: override.MoviePath,
               SeriesPath: override.SeriesPath,
               DisableSearch: override.DisableSearch
@@ -746,12 +791,16 @@
           const override = currentConfig?.UserConfigs?.[userId];
           if (override) {
             txtUserUrl.value = override.Url || '';
+            page.querySelector('#txtUserMetadataUrl').value = override.MetadataUrl || '';
+            page.querySelector('#txtUserAddonUrls').value = (override.AddonUrls || []).join('\n');
             txtUserMoviePath.value = override.MoviePath || '';
             txtUserSeriesPath.value = override.SeriesPath || '';
             chkUserDisableSearch.checked = override.DisableSearch || false;
           } else {
             // New
             txtUserUrl.value = currentConfig?.Url || '';
+            page.querySelector('#txtUserMetadataUrl').value = '';
+            page.querySelector('#txtUserAddonUrls').value = '';
             txtUserMoviePath.value = currentConfig?.MoviePath || '';
             txtUserSeriesPath.value = currentConfig?.SeriesPath || '';
             chkUserDisableSearch.checked = false;
@@ -770,6 +819,8 @@
 
           currentConfig.UserConfigs[userId] = {
             Url: txtUserUrl.value.trim(),
+            MetadataUrl: page.querySelector('#txtUserMetadataUrl').value.trim(),
+            AddonUrls: page.querySelector('#txtUserAddonUrls').value.split(/\r?\n/).map(s => s.trim()).filter(Boolean),
             MoviePath: txtUserMoviePath.value.trim(),
             SeriesPath: txtUserSeriesPath.value.trim(),
             DisableSearch: chkUserDisableSearch.checked

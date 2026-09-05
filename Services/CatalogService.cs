@@ -7,78 +7,40 @@ public class CatalogService(GelatoStremioProviderFactory stremioFactory)
     public async Task<List<CatalogConfig>> GetCatalogsAsync(Guid userId)
     {
         var config = GelatoPlugin.Instance!.Configuration;
-        var provider = stremioFactory.Create(userId);
-        var manifest = await provider.GetManifestAsync();
-
-        if (manifest?.Catalogs == null)
+        var providers = stremioFactory.Create(userId).CatalogProviders.ToArray();
+        var discovered = await Task.WhenAll(providers.Select(async provider =>
         {
-            return config.Catalogs;
-        }
-
-        List<CatalogConfig> catalogs = [];
-
-        // Merge manifest catalogs with local config
-        foreach (var mCatalog in manifest.Catalogs)
-        {
-            if (!mCatalog.IsImportable())
-                continue;
-
-            var existing = config.Catalogs.FirstOrDefault(c =>
-                c.Id == mCatalog.Id && c.Type == mCatalog.Type
-            );
-            if (existing == null)
+            var manifest = await provider.GetManifestAsync();
+            return (manifest?.Catalogs ?? []).Where(c => c.IsImportable() && c.Type is "movie" or "series").Select(c =>
             {
-                existing = new CatalogConfig
+                var saved = config.Catalogs.FirstOrDefault(s => s.Id == c.Id && s.Type == c.Type && s.Source == provider.SourceKey)
+                    ?? (provider == providers[0] ? config.Catalogs.FirstOrDefault(s => s.Id == c.Id && s.Type == c.Type && s.Source == "") : null);
+                return new CatalogConfig
                 {
-                    Id = mCatalog.Id,
-                    Type = mCatalog.Type,
-                    Name = mCatalog.Name,
-                    Enabled = false,
-                    MaxItems = 0, // max items to be imported from this catalog
-                    CreateCollection = false,
-                    Url = "",
+                    Source = provider.SourceKey,
+                    Id = c.Id,
+                    Type = c.Type,
+                    Name = c.Name,
+                    Enabled = saved?.Enabled ?? false,
+                    MaxItems = saved?.MaxItems ?? 0,
+                    CreateCollection = saved?.CreateCollection ?? false,
+                    ShowOnHome = saved?.ShowOnHome ?? true
                 };
-            }
-            else
-            {
-                // Update basic info from manifest just in case
-                existing.Name = mCatalog.Name;
-            }
-            catalogs.Add(existing);
-        }
-        config.Catalogs = catalogs;
-
-        // Save if we added new ones (optional, but good for persistence)
-        GelatoPlugin.Instance.SaveConfiguration();
-
-        return config.Catalogs;
+            }).ToList();
+        }));
+        // Discovery is read-only: dynamic manifests must never overwrite saved preferences.
+        return discovered.SelectMany(c => c).ToList();
     }
 
-    public void UpdateCatalogConfig(CatalogConfig updatedConfig)
+    public void UpdateCatalogConfig(CatalogConfig updated)
     {
         var config = GelatoPlugin.Instance!.Configuration;
-        var existing = config.Catalogs.FirstOrDefault(c =>
-            c.Id == updatedConfig.Id && c.Type == updatedConfig.Type
-        );
-
-        if (existing != null)
-        {
-            existing.Enabled = updatedConfig.Enabled;
-            existing.MaxItems = updatedConfig.MaxItems;
-            existing.CreateCollection = updatedConfig.CreateCollection;
-        }
-        else
-        {
-            config.Catalogs.Add(updatedConfig);
-        }
-
+        var existing = config.Catalogs.FindIndex(c => c.Id == updated.Id && c.Type == updated.Type && c.Source == updated.Source);
+        if (existing >= 0) config.Catalogs[existing] = updated;
+        else config.Catalogs.Add(updated);
         GelatoPlugin.Instance.SaveConfiguration();
     }
 
-    public CatalogConfig? GetCatalogConfig(string id, string type)
-    {
-        return GelatoPlugin.Instance!.Configuration.Catalogs.FirstOrDefault(c =>
-            c.Id == id && c.Type == type
-        );
-    }
+    public CatalogConfig? GetCatalogConfig(string id, string type, string? source = null) =>
+        GelatoPlugin.Instance!.Configuration.Catalogs.FirstOrDefault(c => c.Id == id && c.Type == type && (source is null || c.Source == source));
 }

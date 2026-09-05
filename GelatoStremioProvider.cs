@@ -10,9 +10,20 @@ namespace Gelato;
 public class GelatoStremioProvider(
     string baseUrl,
     IHttpClientFactory http,
-    ILogger<GelatoStremioProvider> log
+    ILogger<GelatoStremioProvider> log,
+    GelatoStremioProvider[]? additionalProviders = null,
+    GelatoStremioProvider? metadataProvider = null,
+    int manifestRefreshSeconds = 300,
+    int requestTimeoutSeconds = 10
 )
 {
+    public string SourceKey { get; } = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(baseUrl)))[..24];
+    public IEnumerable<GelatoStremioProvider> CatalogProviders => new[] { this }.Concat(additionalProviders ?? []).Concat(metadataProvider is null ? [] : new[] { metadataProvider }).DistinctBy(p => p.SourceKey);
+    private DateTime _manifestExpiry;
+    private readonly SemaphoreSlim _manifestLock = new(1, 1);
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, Lazy<Task<StremioMeta?>>> _metaRequests = new(StringComparer.Ordinal);
+    private readonly SemaphoreSlim _httpGate = new(8, 8);
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, Lazy<Task<object?>>> _requests = new(StringComparer.Ordinal);
     private StremioManifest? _manifest;
     private StremioCatalog? _movieSearchCatalog;
     private StremioCatalog? _seriesSearchCatalog;
@@ -25,7 +36,7 @@ public class GelatoStremioProvider(
     private readonly System.Collections.Concurrent.ConcurrentDictionary<
         string,
         (StremioMeta Meta, DateTime Expiry)
-    > _metaCache = new(StringComparer.OrdinalIgnoreCase);
+    > _metaCache = new(StringComparer.Ordinal);
 
     private StremioMeta? GetCachedMeta(string id)
     {
@@ -38,7 +49,7 @@ public class GelatoStremioProvider(
     private HttpClient NewClient()
     {
         var c = http.CreateClient(nameof(GelatoStremioProvider));
-        c.Timeout = TimeSpan.FromSeconds(30);
+        c.Timeout = TimeSpan.FromSeconds(Math.Clamp(requestTimeoutSeconds, 2, 120));
         return c;
     }
 
@@ -61,18 +72,26 @@ public class GelatoStremioProvider(
 
     private async Task<T?> GetJsonAsync<T>(string url)
     {
-        log.LogDebug("GetJsonAsync: requesting {Url}", url);
+        var pending = _requests.GetOrAdd(url, _ => new Lazy<Task<object?>>(async () => await FetchJsonAsync<T>(url)));
+        try { return (T?)await pending.Value; }
+        finally { _requests.TryRemove(new KeyValuePair<string, Lazy<Task<object?>>>(url, pending)); }
+    }
+
+    private async Task<T?> FetchJsonAsync<T>(string url)
+    {
+        await _httpGate.WaitAsync();
+
 
         try
         {
-            var c = NewClient();
-            var resp = await c.GetAsync(url).ConfigureAwait(false); // No using statement
+            using var c = NewClient();
+            using var timeout = new CancellationTokenSource(c.Timeout);
+            using var resp = await c.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, timeout.Token).ConfigureAwait(false);
 
             if (!resp.IsSuccessStatusCode)
             {
                 log.LogWarning(
-                    "GetJsonAsync: request failed for {Url} with {StatusCode} {ReasonPhrase}",
-                    url,
+                    "Addon request failed with {StatusCode} {ReasonPhrase}",
                     resp.StatusCode,
                     resp.ReasonPhrase
                 );
@@ -84,25 +103,39 @@ public class GelatoStremioProvider(
                 );
             }
 
-            await using var s = await resp.Content.ReadAsStreamAsync().ConfigureAwait(false);
-            return await JsonSerializer.DeserializeAsync<T>(s, JsonOpts).ConfigureAwait(false);
+            await using var s = await resp.Content.ReadAsStreamAsync(timeout.Token).ConfigureAwait(false);
+            return await JsonSerializer.DeserializeAsync<T>(s, JsonOpts, timeout.Token).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
-            log.LogError(ex, "GetJsonAsync: error fetching or parsing {Url}", url);
+            log.LogWarning("Addon request failed ({ErrorType})", ex.GetType().Name);
             throw;
         }
+        finally { _httpGate.Release(); }
     }
 
     public async Task<StremioManifest?> GetManifestAsync(bool force = false)
     {
-        if (!force && _manifest is not null)
+        if (!force && _manifestExpiry > DateTime.UtcNow)
             return _manifest;
+        await _manifestLock.WaitAsync();
+        try
+        {
+            if (!force && _manifestExpiry > DateTime.UtcNow)
+                return _manifest;
+            return await FetchManifestAsync();
+        }
+        finally { _manifestLock.Release(); }
+    }
+
+    private async Task<StremioManifest?> FetchManifestAsync()
+    {
         try
         {
             var url = $"{baseUrl}/manifest.json";
             var m = await GetJsonAsync<StremioManifest>(url);
             _manifest = m;
+            _manifestExpiry = DateTime.UtcNow.AddSeconds(Math.Clamp(manifestRefreshSeconds, 30, 86400));
 
             if (m?.Catalogs != null)
             {
@@ -150,15 +183,16 @@ public class GelatoStremioProvider(
         }
         catch (Exception ex)
         {
-            log.LogWarning(ex, "GetManifestAsync: cannot fetch manifest");
-            return null;
+            log.LogWarning("Cannot fetch addon manifest ({ErrorType})", ex.GetType().Name);
+            _manifestExpiry = DateTime.UtcNow.AddSeconds(30);
+            return _manifest;
         }
     }
 
     public async Task<bool> IsReady()
     {
-        var m = await GetManifestAsync();
-        return m is not null;
+        if (metadataProvider is not null) return await metadataProvider.IsReady();
+        return (await Task.WhenAll(new[] { this }.Concat(additionalProviders ?? []).Select(p => p.GetManifestAsync()))).Any(m => m is not null);
     }
 
     public async Task<StremioMeta?> GetMetaAsync(
@@ -167,20 +201,58 @@ public class GelatoStremioProvider(
         TimeSpan? ttl = null
     )
     {
-        var cached = GetCachedMeta(id);
-        if (cached is not null)
-            return cached;
+        if (metadataProvider is not null)
+            return await metadataProvider.GetMetaAsync(id, mediaType, ttl);
+        var key = $"{mediaType}:{id}";
+        var cached = GetCachedMeta(key);
+        if (cached is not null) return cached;
+        var pending = _metaRequests.GetOrAdd(key, _ => new Lazy<Task<StremioMeta?>>(() => FetchMetaAsync(id, mediaType, key, ttl)));
+        try { return await pending.Value; }
+        finally { _metaRequests.TryRemove(new KeyValuePair<string, Lazy<Task<StremioMeta?>>>(key, pending)); }
+    }
 
-        var url = BuildUrl(["meta", mediaType.ToString().ToLower(), id]);
-        var r = await GetJsonAsync<StremioMetaResponse>(url);
+    private async Task<StremioMeta?> FetchMetaAsync(string id, StremioMediaType mediaType, string key, TimeSpan? ttl)
+    {
+        StremioMetaResponse? r = null;
+        if (await SupportsAsync("meta", mediaType.ToString().ToLowerInvariant(), id))
+        {
+            try { r = await GetJsonAsync<StremioMetaResponse>(BuildUrl(["meta", mediaType.ToString().ToLowerInvariant(), id])); }
+            catch (HttpRequestException) when (additionalProviders?.Length > 0) { }
+        }
+        if (r?.Meta is null)
+        {
+            foreach (var provider in additionalProviders ?? [])
+            {
+                try
+                {
+                    var alternative = await provider.GetMetaAsync(id, mediaType, ttl);
+                    if (alternative is not null) { r = new StremioMetaResponse { Meta = alternative }; break; }
+                }
+                catch (Exception ex) { log.LogWarning("Metadata addon failed ({ErrorType})", ex.GetType().Name); }
+            }
+        }
         if (r?.Meta is { } meta)
-            _metaCache[id] = (meta, DateTime.UtcNow.Add(ttl ?? MetaCacheTtl));
+        {
+            if (meta.Type == StremioMediaType.Unknown && !meta.HasExplicitType) meta.Type = mediaType;
+            if (_metaCache.Count >= 1000)
+                foreach (var entry in _metaCache.OrderBy(e => e.Value.Expiry).Take(100)) _metaCache.TryRemove(entry.Key, out _);
+            _metaCache[key] = (meta, DateTime.UtcNow.Add(ttl ?? MetaCacheTtl));
+        }
         return r?.Meta;
+    }
+
+    public async Task<bool> SupportsAsync(string resource, string type, string id)
+    {
+        var manifest = await GetManifestAsync();
+        return manifest is not null && manifest.Resources.Any(r => r.Name == resource
+            && (r.Types.Count > 0 ? r.Types.Contains(type) : manifest.Types.Count == 0 || manifest.Types.Contains(type))
+            && (r.IdPrefixes ?? manifest.IdPrefixes) is var prefixes
+            && (prefixes is null || prefixes.Any(p => id.StartsWith(p, StringComparison.Ordinal))));
     }
 
     public async Task<StremioMeta?> GetMetaAsync(BaseItem item)
     {
-        var id = item.GetProviderId("Imdb");
+        var id = item.GetProviderId("Stremio") ?? item.GetProviderId("Imdb");
         if (id is null)
         {
             log.LogWarning("GetMetaAsync: {Name} has no imdb ID", item.Name);
@@ -270,10 +342,18 @@ public class GelatoStremioProvider(
 
     private async Task<List<StremioStream>> GetStreamsAsync(string id, StremioMediaType mediaType)
     {
-        var url = BuildUrl(["stream", mediaType.ToString().ToLower(), id]);
-        var r = await GetJsonAsync<StremioStreamsResponse>(url);
-
-        return r?.Streams ?? [];
+        var tasks = new[] { this }.Concat(additionalProviders ?? []).Select(async provider =>
+        {
+            try
+            {
+                var type = mediaType.ToString().ToLowerInvariant();
+                if (!await provider.SupportsAsync("stream", type, id)) return new List<StremioStream>();
+                var result = await provider.GetJsonAsync<StremioStreamsResponse>(provider.BuildUrl(["stream", type, id]));
+                return result?.Streams ?? [];
+            }
+            catch (Exception ex) { log.LogWarning("Stream addon failed ({ErrorType})", ex.GetType().Name); return []; }
+        });
+        return (await Task.WhenAll(tasks)).SelectMany(s => s).DistinctBy(s => (s.Url, s.InfoHash, s.FileIdx)).ToList();
     }
 
     public async Task<List<StremioSubtitle>> GetSubtitlesAsync(
@@ -281,9 +361,18 @@ public class GelatoStremioProvider(
         StremioMediaType mediaType
     )
     {
-        var url = BuildUrl(["subtitles", mediaType.ToString().ToLower(), id]);
-        var r = await GetJsonAsync<StremioSubtitleResponse>(url);
-        return r.Subtitles;
+        var type = mediaType.ToString().ToLowerInvariant();
+        var results = await Task.WhenAll(new[] { this }.Concat(additionalProviders ?? []).Select(async provider =>
+        {
+            try
+            {
+                if (!await provider.SupportsAsync("subtitles", type, id)) return new List<StremioSubtitle>();
+                var response = await provider.GetJsonAsync<StremioSubtitleResponse>(provider.BuildUrl(["subtitles", type, id]));
+                return response.Subtitles ?? [];
+            }
+            catch (Exception ex) { log.LogWarning("Subtitle addon failed ({ErrorType})", ex.GetType().Name); return []; }
+        }));
+        return results.SelectMany(r => r).DistinctBy(s => (s.Url, s.Lang)).ToList();
     }
 
     public async Task<IReadOnlyList<StremioMeta>> GetCatalogMetasAsync(
@@ -302,7 +391,10 @@ public class GelatoStremioProvider(
         // seen maybe one type thats capital, but thats their issue
         var url = BuildUrl(["catalog", mediaType.ToLower(), id], extras);
         var r = await GetJsonAsync<StremioCatalogResponse>(url);
-        return r?.Metas ?? [];
+        var metas = r?.Metas ?? [];
+        if (Enum.TryParse<StremioMediaType>(mediaType, true, out var parsed))
+            foreach (var meta in metas.Where(m => m.Type == StremioMediaType.Unknown && !m.HasExplicitType)) meta.Type = parsed;
+        return metas;
     }
 
     public async Task<IReadOnlyList<StremioMeta>> SearchAsync(
@@ -311,27 +403,21 @@ public class GelatoStremioProvider(
         int? skip = null
     )
     {
-        var manifest = await GetManifestAsync();
-        if (manifest == null)
-            return [];
-
-        var catalog = mediaType switch
+        if (metadataProvider is not null) return await metadataProvider.SearchAsync(query, mediaType, skip);
+        var type = mediaType.ToString().ToLowerInvariant();
+        var results = await Task.WhenAll(new[] { this }.Concat(additionalProviders ?? []).Select(async provider =>
         {
-            StremioMediaType.Movie => _movieSearchCatalog,
-            StremioMediaType.Series => _seriesSearchCatalog,
-            _ => null,
-        };
-
-        if (catalog == null)
-        {
-            log.LogError(
-                "SearchAsync: {mediaType} has no search catalog, please enable one in aiostreams.",
-                mediaType
-            );
-            return [];
-        }
-
-        return await GetCatalogMetasAsync(catalog.Id, mediaType.ToString(), query, skip);
+            var manifest = await provider.GetManifestAsync();
+            var catalogs = (manifest?.Catalogs ?? []).Where(c => c.Type == type && c.IsSearchCapable()
+                && !c.Extra.Any(e => e.IsRequired && e.Name != "search"));
+            var pages = await Task.WhenAll(catalogs.Select(async catalog =>
+            {
+                try { return await provider.GetCatalogMetasAsync(catalog.Id, type, query, catalog.Extra.Any(e => e.Name == "skip") ? skip : null); }
+                catch (Exception ex) { log.LogWarning("Search addon failed ({ErrorType})", ex.GetType().Name); return (IReadOnlyList<StremioMeta>)Array.Empty<StremioMeta>(); }
+            }));
+            return pages.SelectMany(p => p);
+        }));
+        return results.SelectMany(r => r).DistinctBy(m => (m.Type, m.Id)).ToArray();
     }
 }
 
@@ -347,6 +433,7 @@ public class StremioManifest
     public string Version { get; set; } = "";
     public string? Description { get; set; }
     public List<StremioCatalog> Catalogs { get; set; } = new();
+    public List<string>? IdPrefixes { get; set; }
     public List<StremioResource> Resources { get; set; } = new();
     public List<string> Types { get; set; } = new();
     public string? Background { get; set; }
@@ -382,11 +469,12 @@ public class StremioExtra
     public List<string> Options { get; set; } = new();
 }
 
+[JsonConverter(typeof(StremioResourceConverter))]
 public class StremioResource
 {
     public string Name { get; set; } = "";
     public List<string> Types { get; set; } = new();
-    public List<string> IdPrefixes { get; set; } = new();
+    public List<string>? IdPrefixes { get; set; }
 }
 
 public class StremioCatalogResponse
@@ -451,8 +539,10 @@ public class StremioMeta
 {
     public required string Id { get; set; }
 
-    [JsonConverter(typeof(JsonStringEnumConverter))]
-    public StremioMediaType Type { get; set; } = StremioMediaType.Unknown;
+    [JsonConverter(typeof(SafeStringEnumConverter<StremioMediaType>))]
+    public StremioMediaType Type { get => _type; set { _type = value; HasExplicitType = true; } }
+    private StremioMediaType _type;
+    [JsonIgnore] public bool HasExplicitType { get; private set; }
     public string? Name { get; set; }
     public string? Title { get; set; }
     public string? Poster { get; set; }
@@ -1082,5 +1172,28 @@ public sealed class StringOrArrayConverter : JsonConverter<string?>
             w.WriteStringValue(v);
         else
             w.WriteNullValue();
+    }
+}
+
+public sealed class StremioResourceConverter : JsonConverter<StremioResource>
+{
+    public override StremioResource Read(ref Utf8JsonReader reader, Type type, JsonSerializerOptions options)
+    {
+        if (reader.TokenType == JsonTokenType.String) return new() { Name = reader.GetString() ?? "" };
+        using var doc = JsonDocument.ParseValue(ref reader);
+        var root = doc.RootElement;
+        return new()
+        {
+            Name = root.GetProperty("name").GetString() ?? "",
+            Types = root.TryGetProperty("types", out var types) ? types.Deserialize<List<string>>(options) ?? [] : [],
+            IdPrefixes = root.TryGetProperty("idPrefixes", out var prefixes) ? prefixes.Deserialize<List<string>>(options) : null
+        };
+    }
+    public override void Write(Utf8JsonWriter writer, StremioResource value, JsonSerializerOptions options)
+    {
+        writer.WriteStartObject(); writer.WriteString("name", value.Name);
+        writer.WritePropertyName("types"); JsonSerializer.Serialize(writer, value.Types, options);
+        if (value.IdPrefixes is not null) { writer.WritePropertyName("idPrefixes"); JsonSerializer.Serialize(writer, value.IdPrefixes, options); }
+        writer.WriteEndObject();
     }
 }

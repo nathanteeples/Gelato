@@ -40,6 +40,7 @@ public class ServiceRegistrator : IPluginServiceRegistrator
         services.AddSingleton<GelatoStremioProviderFactory>();
         services.AddSingleton(sp => new Lazy<GelatoManager>(sp.GetRequiredService<GelatoManager>));
         services.AddSingleton<CatalogService>();
+        services.AddSingleton<CatalogPreviewService>();
         services.AddSingleton<CatalogImportService>();
         services.AddSingleton<PalcoCacheService>();
         services.AddSingleton<IHostedService, GelatoJavaScriptRegistrationService>();

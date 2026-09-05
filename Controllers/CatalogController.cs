@@ -1,7 +1,6 @@
 using Gelato.Config;
 using Gelato.ScheduledTasks;
 using Gelato.Services;
-using MediaBrowser.Controller.Library;
 using MediaBrowser.Model.Tasks;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
@@ -17,18 +16,53 @@ public class CatalogController(
     CatalogService catalogService,
     CatalogImportService importService,
     ITaskManager taskManager,
-    ILibraryManager libraryManager
+    CatalogPreviewService previews,
+    GelatoManager manager
 ) : ControllerBase
 {
+    private Guid? CurrentUserId => Guid.TryParse(User.Claims.FirstOrDefault(c => c.Type is "Jellyfin-UserId" or "UserId")?.Value, out var id) && id != Guid.Empty ? id : null;
+
+    [HttpGet("home")]
+    public async Task<IActionResult> Home()
+    {
+        if (CurrentUserId is not { } userId) return Unauthorized();
+        if (!GelatoPlugin.Instance!.Configuration.EnableHomeRows) return Ok(Array.Empty<object>());
+        var catalogs = await catalogService.GetCatalogsAsync(userId);
+        return Ok(catalogs.Where(c => c.ShowOnHome).Select(c => new { c.Source, c.Id, c.Type, c.Name }));
+    }
+
+    [HttpGet("home/{source}/{type}/{id}")]
+    public async Task<IActionResult> Preview(string source, string type, string id)
+    {
+        if (CurrentUserId is not { } userId) return Unauthorized();
+        if (!GelatoPlugin.Instance!.Configuration.EnableHomeRows) return NotFound();
+        var catalog = (await catalogService.GetCatalogsAsync(userId)).FirstOrDefault(c => c.Source == source && c.Type == type && c.Id == id && c.ShowOnHome);
+        if (catalog is null) return NotFound();
+        var items = await previews.GetAsync(userId, catalog, HttpContext.RequestAborted);
+        return Ok(items.Select(meta => new { meta.Id, Type = meta.Type.ToString().ToLowerInvariant(), Name = meta.GetName(), Poster = CatalogPreviewService.Thumbnail(meta.Poster), Year = meta.GetYear() }));
+    }
+
+    [HttpPost("home/{source}/{type}/{id}/open/{itemId}")]
+    public async Task<IActionResult> Open(string source, string type, string id, string itemId)
+    {
+        if (CurrentUserId is not { } userId) return Unauthorized();
+        if (!GelatoPlugin.Instance!.Configuration.EnableHomeRows) return NotFound();
+        var catalog = (await catalogService.GetCatalogsAsync(userId)).FirstOrDefault(c => c.Source == source && c.Type == type && c.Id == id && c.ShowOnHome);
+        if (catalog is null) return NotFound();
+        var meta = (await previews.GetAsync(userId, catalog, HttpContext.RequestAborted)).FirstOrDefault(m => m.Id == itemId);
+        if (meta is null || manager.IntoBaseItem(meta) is not { } item) return NotFound();
+        manager.SaveStremioMeta(item.Id, meta);
+        return Ok(new { item.Id });
+    }
+
+    [Authorize(Policy = "RequiresElevation")]
     [HttpGet]
     public async Task<ActionResult<List<CatalogConfig>>> GetCatalogs()
     {
-        // Use Global user for now, or HttpContext.User if we want per-user catalogs later
-        // But CatalogService currently uses Guid.Empty for global config if passed
-        // We'll stick to global administration for now as per plan
         return await catalogService.GetCatalogsAsync(Guid.Empty);
     }
 
+    [Authorize(Policy = "RequiresElevation")]
     [HttpPost("{id}/{type}/config")]
     public ActionResult UpdateConfig(
         [FromRoute] string id,
@@ -45,28 +79,17 @@ public class CatalogController(
         return Ok();
     }
 
+    [Authorize(Policy = "RequiresElevation")]
     [HttpPost("{id}/{type}/import")]
-    public Task<ActionResult> TriggerImport([FromRoute] string id, [FromRoute] string type)
+    public Task<ActionResult> TriggerImport([FromRoute] string id, [FromRoute] string type, [FromQuery] string? source = null)
     {
         logger.LogInformation("Manual import triggered for {Id} {Type}", id, type);
-
-        // Run in background? Or await?
-        // User probably wants to know it started.
-        // Awaiting might timeout if it takes long.
-        // But existing implementations awaited.
-        // Let's fire and forget but log, or return accepted.
-        // "Straight approach" -> maybe just await it so user sees errors?
-        // But browser timeout is 2 mins usually. Import can take longer.
-        // Better to run in background.
 
         _ = Task.Run(async () =>
         {
             try
             {
-                await importService.ImportCatalogAsync(id, type, CancellationToken.None);
-                //await libraryManager
-                //    .ValidateMediaLibrary(new Progress<double>(), CancellationToken.None)
-                //    .ConfigureAwait(false);
+                await importService.ImportCatalogAsync(id, type, CancellationToken.None, source: source);
             }
             catch (Exception ex)
             {
@@ -77,6 +100,7 @@ public class CatalogController(
         return Task.FromResult<ActionResult>(Accepted());
     }
 
+    [Authorize(Policy = "RequiresElevation")]
     [HttpPost("import-all")]
     public ActionResult ImportAll()
     {

@@ -39,7 +39,9 @@ public sealed class GelatoApiController : ControllerBase
         [FromRoute, Required] string id
     )
     {
-        var cfg = GelatoPlugin.Instance!.GetConfig(Guid.Empty);
+        if (!Guid.TryParse(User.Claims.FirstOrDefault(c => c.Type is "Jellyfin-UserId" or "UserId")?.Value, out var userId) || userId == Guid.Empty)
+            return Unauthorized();
+        var cfg = GelatoPlugin.Instance!.GetConfig(userId);
         var meta = await cfg.Stremio.GetMetaAsync(id, stremioMetaType);
         if (meta is null)
         {

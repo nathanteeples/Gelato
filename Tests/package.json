@@ -1,0 +1,5 @@
+{
+  "private": true,
+  "scripts": { "test": "node frontend.cjs" },
+  "devDependencies": { "jsdom": "29.1.1" }
+}
