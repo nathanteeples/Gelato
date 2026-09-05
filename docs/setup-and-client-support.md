@@ -1,6 +1,15 @@
 # Setup and client support
 
-This branch extends the existing fork; it does not create a new fork or deploy to a server.
+This branch extends the existing fork. Test build 0.27.0.1 is available for Jellyfin 10.11.6 or later in the 10.11 series.
+
+Add this repository URL in Jellyfin Dashboard → Plugins → Repositories:
+
+`https://raw.githubusercontent.com/nathanteeples/Gelato/refs/heads/gh-pages/repository.json`
+
+Install Gelato 0.27.0.1 from the catalogue and restart Jellyfin. This is a preview build
+with the same plugin identity as upstream Gelato, so it replaces that installed plugin.
+The source remains on the draft PR branch; native home-row UI and live acceptance
+validation remain incomplete.
 
 ## Configure addons
 
