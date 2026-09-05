@@ -1,0 +1,20 @@
+[
+  {
+    "category": "General",
+    "description": "Gelato preview: multiple Stremio addons, direct AIOMetadata, dynamic catalogues and thumbnail improvements. Native client home rows require client integration.",
+    "guid": "94EA4E14-8163-4989-96FE-0A2094BC2D6A",
+    "name": "Gelato",
+    "overview": "Stremio integration \u2014 test builds from nathanteeples/Gelato.",
+    "owner": "nathanteeples",
+    "versions": [
+      {
+        "changelog": "Preview build from PR #1. Adds standard addon routing, direct AIOMetadata, dynamic catalogue previews and efficient collection/thumbnail updates. Native home-row UI remains client-specific work.",
+        "checksum": "75078246001c77daa241addba59b88c4",
+        "sourceUrl": "https://github.com/nathanteeples/Gelato/releases/download/v0.27.0.1-preview/gelato_0.27.0.1.zip",
+        "targetAbi": "10.11.6.0",
+        "timestamp": "2026-09-05T23:07:08Z",
+        "version": "0.27.0.1"
+      }
+    ]
+  }
+]
