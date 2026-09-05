@@ -13,6 +13,9 @@ public class PluginConfiguration : BasePluginConfiguration
     public int StreamTTL { get; set; } = 3600;
     public int CatalogMaxItems { get; set; } = 100;
     public string Url { get; set; } = "";
+    public string MetadataUrl { get; set; } = "";
+    public List<string> AddonUrls { get; set; } = [];
+
     public bool EnableMixed { get; set; } = false;
     public bool ExtendLocalSeriesTrees { get; set; } = false;
     public bool FilterUnreleased { get; set; } = false;
@@ -27,7 +30,11 @@ public class PluginConfiguration : BasePluginConfiguration
     public int MaxCollectionItems { get; set; } = 100;
     public bool DisableSearch { get; set; } = false;
     public bool EnableJavaScriptInjection { get; set; } = false;
-    public bool LazyImages { get; set; } = false;
+    public bool LazyImages { get; set; } = true;
+    public int RequestTimeoutSeconds { get; set; } = 10;
+    public int ManifestRefreshSeconds { get; set; } = 300;
+    public int CatalogRefreshSeconds { get; set; } = 300;
+    public bool EnableHomeRows { get; set; } = false;
     public List<CatalogConfig> Catalogs { get; set; } = [];
     public List<UserConfig> UserConfigs { get; set; } = [];
 
@@ -36,12 +43,21 @@ public class PluginConfiguration : BasePluginConfiguration
         if (string.IsNullOrWhiteSpace(Url))
             throw new InvalidOperationException("Gelato Url not configured.");
 
-        var u = Url.Trim().TrimEnd('/');
+        return NormalizeUrl(Url);
+    }
 
-        if (u.EndsWith("/manifest.json", StringComparison.OrdinalIgnoreCase))
-            u = u[..^"/manifest.json".Length];
-
-        return u;
+    public static string NormalizeUrl(string url)
+    {
+        var value = url.Trim().TrimEnd('/');
+        if (value.StartsWith("stremio://", StringComparison.OrdinalIgnoreCase))
+            value = "https://" + value[10..];
+        if (value.EndsWith("/manifest.json", StringComparison.OrdinalIgnoreCase))
+            value = value[..^14];
+        if (!Uri.TryCreate(value, UriKind.Absolute, out var uri)
+            || (uri.Scheme != "http" && uri.Scheme != "https")
+            || !string.IsNullOrEmpty(uri.Query) || !string.IsNullOrEmpty(uri.Fragment))
+            throw new ArgumentException("Use an HTTP(S) addon base or manifest URL without query or fragment.");
+        return value;
     }
 
     [JsonIgnore]
@@ -67,6 +83,9 @@ public class UserConfig
 {
     public Guid UserId { get; set; }
     public string Url { get; set; } = "";
+    public string MetadataUrl { get; set; } = "";
+    public List<string> AddonUrls { get; set; } = [];
+
     public string MoviePath { get; set; } = "";
     public string SeriesPath { get; set; } = "";
     public bool DisableSearch { get; set; } = false;
@@ -80,6 +99,15 @@ public class UserConfig
         {
             // User overridable fields - all required, no fallback to baseConfig
             Url = Url,
+            MetadataUrl = string.IsNullOrWhiteSpace(MetadataUrl) ? baseConfig.MetadataUrl : MetadataUrl,
+            AddonUrls = AddonUrls,
+            LazyImages = baseConfig.LazyImages,
+            EnableJavaScriptInjection = baseConfig.EnableJavaScriptInjection,
+            EnableHomeRows = baseConfig.EnableHomeRows,
+            CatalogRefreshSeconds = baseConfig.CatalogRefreshSeconds,
+            ManifestRefreshSeconds = baseConfig.ManifestRefreshSeconds,
+            RequestTimeoutSeconds = baseConfig.RequestTimeoutSeconds,
+            Catalogs = baseConfig.Catalogs,
             MoviePath = MoviePath,
             SeriesPath = SeriesPath,
             DisableSearch = DisableSearch,
@@ -109,7 +137,7 @@ public class GelatoStremioProviderFactory(IHttpClientFactory http, ILoggerFactor
     private readonly System.Collections.Concurrent.ConcurrentDictionary<
         string,
         GelatoStremioProvider
-    > _cache = new(StringComparer.OrdinalIgnoreCase);
+    > _cache = new(StringComparer.Ordinal);
 
     public GelatoStremioProvider Create(Guid userId)
     {
@@ -119,11 +147,15 @@ public class GelatoStremioProviderFactory(IHttpClientFactory http, ILoggerFactor
 
     public GelatoStremioProvider Create(PluginConfiguration cfg)
     {
-        var baseUrl = cfg.GetBaseUrl();
-        return _cache.GetOrAdd(
-            baseUrl,
-            url => new GelatoStremioProvider(url, http, log.CreateLogger<GelatoStremioProvider>())
-        );
+        var urls = new[] { cfg.GetBaseUrl() }.Concat(cfg.AddonUrls.Where(u => !string.IsNullOrWhiteSpace(u)).Select(PluginConfiguration.NormalizeUrl)).Distinct(StringComparer.Ordinal).ToArray();
+        var metadata = string.IsNullOrWhiteSpace(cfg.MetadataUrl) ? null : PluginConfiguration.NormalizeUrl(cfg.MetadataUrl);
+        var key = System.Text.Json.JsonSerializer.Serialize(new { urls, metadata, cfg.ManifestRefreshSeconds, cfg.RequestTimeoutSeconds });
+        return _cache.GetOrAdd(key, _ =>
+        {
+            GelatoStremioProvider Endpoint(string url) => new(url, http, log.CreateLogger<GelatoStremioProvider>(), manifestRefreshSeconds: cfg.ManifestRefreshSeconds, requestTimeoutSeconds: cfg.RequestTimeoutSeconds);
+            return new GelatoStremioProvider(urls[0], http, log.CreateLogger<GelatoStremioProvider>(),
+                urls.Skip(1).Select(Endpoint).ToArray(), metadata is null ? null : Endpoint(metadata), cfg.ManifestRefreshSeconds, cfg.RequestTimeoutSeconds);
+        });
     }
 
     public void ClearCache() => _cache.Clear();
@@ -131,6 +163,9 @@ public class GelatoStremioProviderFactory(IHttpClientFactory http, ILoggerFactor
 
 public class CatalogConfig
 {
+    public string Source { get; set; } = "";
+    public bool ShowOnHome { get; set; } = true;
+
     public string Id { get; set; } = "";
     public string Type { get; set; } = "movie";
     public string Name { get; set; } = "";

@@ -18,6 +18,7 @@
     <PackageReference Include="System.Reflection.TypeExtensions" Version="4.7.0" />
     <PackageReference Include="Microsoft.Data.Sqlite.Core" Version="9.0.0" PrivateAssets="all" />
   </ItemGroup>
+  <ItemGroup><Compile Remove="Tests/**/*.cs" /></ItemGroup>
   <ItemGroup>
     <EmbeddedResource Include="Config\config.html" />
     <!-- Embed all frontend assets so they are delivered with the plugin -->

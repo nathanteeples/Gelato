@@ -1,3 +1,4 @@
+using Gelato.Services;
 using Jellyfin.Database.Implementations.Entities;
 using MediaBrowser.Common.Configuration;
 using MediaBrowser.Controller.Drawing;
@@ -15,9 +16,11 @@ public sealed class ImageProcessorDecorator(
     IApplicationPaths appPaths,
     Lazy<ProviderManagerDecorator> providerManager,
     Lazy<ILibraryManager> libraryManager,
-    ILogger<ImageProcessorDecorator> log
+    ILogger<ImageProcessorDecorator> log,
+    IHttpClientFactory http
 ) : IImageProcessor
 {
+    private readonly PreviewCache<string> _thumbnails = new(256);
     private string GelatoImagesDir => Path.Combine(appPaths.DataPath, "gelato", "images");
 
     // Return a hardcoded blurhash for any zero-byte/missing placeholder that has a .url sidecar,
@@ -65,6 +68,18 @@ public sealed class ImageProcessorDecorator(
                     var url = (await File.ReadAllTextAsync(urlFile).ConfigureAwait(false)).Trim();
                     try
                     {
+                        var width = options.Width ?? options.MaxWidth;
+                        var height = options.Height ?? options.MaxHeight;
+                        var smallUrl = CatalogPreviewService.Thumbnail(url);
+                        if (options.Image!.Type == ImageType.Primary && width is > 0 and <= 342
+                            && (height is null or > 0 and <= 513) && smallUrl is not null && smallUrl != url)
+                        {
+                            var thumbnail = await _thumbnails.GetAsync(smallUrl, TimeSpan.FromHours(1), () => DownloadThumbnailAsync(smallUrl));
+                            var original = options.Image;
+                            options.Image = new ItemImageInfo { Path = thumbnail, Type = original.Type, DateModified = File.GetLastWriteTimeUtc(thumbnail) };
+                            try { return await inner.ProcessImage(options).ConfigureAwait(false); }
+                            finally { options.Image = original; }
+                        }
                         await providerManager.Value
                             .SaveImageDirect(
                                 options.Item,
@@ -106,6 +121,39 @@ public sealed class ImageProcessorDecorator(
         }
 
         return await inner.ProcessImage(options).ConfigureAwait(false);
+    }
+
+    private async Task<string> DownloadThumbnailAsync(string url)
+    {
+        var directory = Path.Combine(appPaths.CachePath, "gelato-thumbnails");
+        Directory.CreateDirectory(directory);
+        var hash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(url)));
+        var path = Path.Combine(directory, hash + ".jpg");
+        if (File.Exists(path)) return path;
+        using var client = http.CreateClient(nameof(ImageProcessorDecorator));
+        client.Timeout = TimeSpan.FromSeconds(10);
+        using var response = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
+        response.EnsureSuccessStatusCode();
+        const int maxBytes = 4 * 1024 * 1024;
+        if (response.Content.Headers.ContentLength > maxBytes) throw new IOException("Thumbnail exceeds size limit.");
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        await using var source = await response.Content.ReadAsStreamAsync(timeout.Token);
+        using var bytes = new MemoryStream();
+        var buffer = new byte[16384];
+        int read;
+        while ((read = await source.ReadAsync(buffer, timeout.Token)) > 0)
+        {
+            if (bytes.Length + read > maxBytes) throw new IOException("Thumbnail exceeds size limit.");
+            bytes.Write(buffer, 0, read);
+        }
+        var temporary = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+        try
+        {
+            await File.WriteAllBytesAsync(temporary, bytes.ToArray(), timeout.Token);
+            File.Move(temporary, path, true);
+        }
+        finally { if (File.Exists(temporary)) File.Delete(temporary); }
+        return path;
     }
 
     // Returns the .url sidecar path to use, checking the image's own path first, then

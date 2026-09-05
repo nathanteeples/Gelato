@@ -26,9 +26,16 @@ Bring the power of Stremio addons directly into Jellyfin. This plugin replaces J
 - **Per user settings** - Users can have their own manifest, perfect for age restricted accounts.
 - **More Content, Less Hassle** – Expand Jellyfin with community-driven Stremio catalogs
 
+## Extended addon support in this fork
+
+This fork adds multiple standard Stremio addon endpoints, direct AIOMetadata routing,
+refreshable catalogue previews, incremental collection updates, and smaller TMDB
+thumbnail fetching. See [setup and client support](docs/setup-and-client-support.md)
+for configuration, native-client boundaries, tests and remaining live validation.
+
 ## Usage
 
-1. Setup an aiostreams manifest. You can selfhost or use an public instance, for example: [Elfhosted public instance](https://aiostreams.elfhosted.com/stremio/configure)
+1. Set up a Stremio addon manifest (AIOStreams remains supported). You can selfhost or use an public instance, for example: [Elfhosted public instance](https://aiostreams.elfhosted.com/stremio/configure)
    
    If you are new to debrid and are signing up please use one of my <a href="https://github.com/lostb1t/Gelato?tab=readme-ov-file#support-me">referrals</a>.
    
@@ -38,7 +45,7 @@ Bring the power of Stremio addons directly into Jellyfin. This plugin replaces J
 2. Make sure you are running Jellyfin 10.11 and add `https://raw.githubusercontent.com/lostb1t/Gelato/refs/heads/gh-pages/repository.json` to your plugin repositories.
 
 3. Install and configure the plugin.
-   **Note:** Only **AIOStreams** is supported.
+   Configure the optional direct AIOMetadata endpoint and additional addons as needed.
 
 4. Add the configured base paths to the Jellyfin library of your choice. After adding them, start a library scan.
 
@@ -51,11 +58,11 @@ For a more in depth guide see [starter guide](https://github.com/lostb1t/Gelato/
 
 ## Notes
 
-- Only **AIOStreams** is supported
+- Standard movie/series addon resources are supported; see the compatibility boundaries above.
 
 ### FAQ
 
-- You need to restart the server after editing the manifest/config in aiostreams.
+- Manifests refresh periodically; saving Gelato configuration also clears provider caches.
 - You should have at least one search enabled catalog. I suggest the tmdb addon.
 - if something borked or you want to start over, you can use the purge task under scheduled tasks.
 - I suggest lowering the default timeout on your stremio addons in aiostreams (5 seconds for example)

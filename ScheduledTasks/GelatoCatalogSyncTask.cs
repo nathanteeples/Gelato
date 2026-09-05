@@ -14,7 +14,8 @@ public sealed class GelatoCatalogItemsSyncTask(
     public string Description => "Imports items from enabled Stremio catalogs into Jellyfin.";
     public string Category => "Gelato";
 
-    public IEnumerable<TaskTriggerInfo> GetDefaultTriggers() => [];
+    public IEnumerable<TaskTriggerInfo> GetDefaultTriggers() =>
+        [new TaskTriggerInfo { Type = TaskTriggerInfoType.IntervalTrigger, IntervalTicks = TimeSpan.FromMinutes(30).Ticks }];
 
     public async Task ExecuteAsync(IProgress<double> progress, CancellationToken ct)
     {
